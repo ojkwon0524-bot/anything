@@ -3,7 +3,7 @@ name: cgv-imax-watch
 on:
   # Times are UTC. 22:00-15:00 UTC == 07:00-01:00 KST.
   schedule:
-    - cron: "*/5 22,23,0-15 * * *"
+    - cron: "3-58/5 22,23,0-15 * * *"
   workflow_dispatch:
     inputs:
       mode:
