@@ -169,18 +169,32 @@ def save_state(state):
 # --------------------------------------------------------------------------
 
 def notify(text):
+    """Send to Telegram. Returns True only if Telegram actually accepted it."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("[no telegram credentials — message would have been]\n" + text)
-        return
-    resp = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-        timeout=20,
-    )
+        missing = [
+            n for n, v in (("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat_id))
+            if not v
+        ]
+        print(f"!! NOT SENT — missing secret(s): {', '.join(missing)}")
+        print("   (check Settings > Secrets and variables > Actions > Secrets tab)")
+        print("   message would have been:\n" + text)
+        return False
+    print(f"sending to chat {chat_id} using token ending ...{token[-6:]}")
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        print(f"!! NOT SENT — network error: {exc}", file=sys.stderr)
+        return False
     if resp.status_code != 200:
-        print(f"telegram error {resp.status_code}: {resp.text}", file=sys.stderr)
+        print(f"!! NOT SENT — telegram {resp.status_code}: {resp.text}", file=sys.stderr)
+        return False
+    return True
 
 
 def build_message(findings):
@@ -205,6 +219,7 @@ def build_message(findings):
 def run(alerts=True, quiet=False):
     state = load_state()
     findings = {}
+    pending = {}
     errors = []
 
     for site_no, name in THEATERS.items():
@@ -233,6 +248,7 @@ def run(alerts=True, quiet=False):
             # Only shout if at least one new date actually has IMAX.
             if any(shows for _, shows in detail):
                 findings[name] = detail
+                pending[site_no] = fresh
 
         state["seen"][site_no] = sorted(seen | set(dates))
         time.sleep(random.uniform(0.4, 0.9))
@@ -246,8 +262,18 @@ def run(alerts=True, quiet=False):
     save_state(state)
 
     if findings and alerts:
-        notify(build_message(findings))
-        print("ALERT SENT")
+        if notify(build_message(findings)):
+            print("ALERT DELIVERED")
+        else:
+            # Delivery failed — forget these dates so the next run retries
+            # instead of silently swallowing the one alert that mattered.
+            for site_no, fresh in pending.items():
+                state["seen"][site_no] = sorted(
+                    set(state["seen"].get(site_no, [])) - set(fresh)
+                )
+            save_state(state)
+            print("ALERT FAILED — will retry next run")
+            return 1
     elif not alerts and not quiet:
         total = sum(len(v) for v in state["seen"].values())
         print(f"baseline recorded: {total} dates across {len(THEATERS)} theaters")
