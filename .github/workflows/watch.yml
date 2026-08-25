@@ -3,6 +3,9 @@ name: cgv-imax-watch
 on:
   # Times are UTC. 22:00-15:00 UTC == 07:00-01:00 KST.
   schedule:
+    # CGV has no fixed opening time - each theater opens dates manually - so
+    # this sweeps uniformly. Offset minutes (:03, :08...) avoid the :00/:05
+    # congestion when every workflow on GitHub fires at once.
     - cron: "3-58/5 22,23,0-15 * * *"
   workflow_dispatch:
     inputs:
@@ -20,6 +23,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +39,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MOV_NO: ${{ vars.MOV_NO || '30001323' }}
           MOV_LABEL: ${{ vars.MOV_LABEL || '오디세이' }}
+          TARGET_TIMES: ${{ vars.TARGET_TIMES }}
         run: |
           case "${{ github.event.inputs.mode }}" in
             baseline) python check.py --baseline ;;
