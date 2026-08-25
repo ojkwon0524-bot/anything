@@ -36,6 +36,15 @@ MOV_NO = os.environ.get("MOV_NO", "30001323")          # 오디세이
 MOV_LABEL = os.environ.get("MOV_LABEL", "오디세이")
 STATE_PATH = os.environ.get("STATE_PATH", "state.json")
 
+# KST times to camp on, comma separated "HH:MM". Empty by default: CGV has no
+# fixed schedule (each theater opens dates manually). Set this only if the
+# openings log in state.json shows a real pattern.
+TARGET_TIMES = os.environ.get("TARGET_TIMES", "")
+# How early the script starts standing at the door, and how long it waits after.
+LEAD_MINUTES = int(os.environ.get("LEAD_MINUTES", "20"))
+TRAIL_MINUTES = int(os.environ.get("TRAIL_MINUTES", "6"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "20"))
+
 HEADERS = {
     "accept": "application/json",
     "accept-language": "ko-KR",
@@ -150,10 +159,17 @@ def pretty_date(ymd):
 def load_state():
     if not os.path.exists(STATE_PATH):
         return {"movNo": MOV_NO, "seen": {}}
-    with open(STATE_PATH, encoding="utf-8") as fh:
-        state = json.load(fh)
+    try:
+        with open(STATE_PATH, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        # A hand-edit left the file unreadable. Don't crash and don't alert on
+        # everything — rebuild quietly from what CGV says right now.
+        print(f"!! {STATE_PATH} is unreadable ({exc})")
+        print("   rebuilding it this run; no alerts will be sent this time.")
+        return {"movNo": MOV_NO, "seen": {}, "recovered": True}
     if state.get("movNo") != MOV_NO:  # tracking a different film — start clean
-        return {"movNo": MOV_NO, "seen": {}}
+        return {"movNo": MOV_NO, "seen": {}, "recovered": True}
     state.setdefault("seen", {})
     return state
 
@@ -197,9 +213,12 @@ def notify(text):
     return True
 
 
-def build_message(findings):
-    lines = [f"🎬 {MOV_LABEL} — IMAX 예매 오픈!", ""]
-    for theater, dates in findings.items():
+def build_message(findings, detected=None):
+    detected = detected or datetime.datetime.now(KST)
+    lines = [f"🎬 {MOV_LABEL} — IMAX 예매 오픈!",
+             f"감지: {detected:%m/%d} ({'월화수목금토일'[detected.weekday()]}) {detected:%H:%M}",
+             ""]
+    for site_no, (theater, dates) in findings.items():
         lines.append(f"▪ CGV {theater}")
         for ymd, shows in dates:
             if shows:
@@ -209,8 +228,10 @@ def build_message(findings):
                 lines.append(f"  {pretty_date(ymd)}  {times}")
             else:
                 lines.append(f"  {pretty_date(ymd)}  (IMAX 회차 없음)")
+        # bzplcNo is siteNo + "001" — straight to this theater's page.
+        lines.append(f"  https://cgv.co.kr/cnm/bzplcCgv/{site_no}001")
         lines.append("")
-    lines.append("https://cgv.co.kr/cnm/movieBook/movie")
+    lines.append("전체 예매: https://cgv.co.kr/cnm/movieBook/movie")
     return "\n".join(lines)
 
 
@@ -218,6 +239,8 @@ def build_message(findings):
 
 def run(alerts=True, quiet=False):
     state = load_state()
+    if state.pop("recovered", False):
+        alerts = False
     findings = {}
     pending = {}
     errors = []
@@ -247,7 +270,7 @@ def run(alerts=True, quiet=False):
                 time.sleep(random.uniform(0.4, 0.9))
             # Only shout if at least one new date actually has IMAX.
             if any(shows for _, shows in detail):
-                findings[name] = detail
+                findings[site_no] = (name, detail)
                 pending[site_no] = fresh
 
         state["seen"][site_no] = sorted(seen | set(dates))
@@ -262,8 +285,23 @@ def run(alerts=True, quiet=False):
     save_state(state)
 
     if findings and alerts:
-        if notify(build_message(findings)):
+        detected = datetime.datetime.now(KST)
+        if notify(build_message(findings, detected)):
             print("ALERT DELIVERED")
+            # Keep a running log of when openings actually happen. After a few
+            # of these, a real pattern may show up — that's when TARGET_TIMES
+            # becomes worth setting.
+            log = state.setdefault("openings", [])
+            for site_no, (theater, dates) in findings.items():
+                log.append({
+                    "detected": detected.isoformat(timespec="seconds"),
+                    "weekday": "월화수목금토일"[detected.weekday()],
+                    "theater": theater,
+                    "dates": [ymd for ymd, _ in dates],
+                })
+            state["openings"] = log[-60:]
+            save_state(state)
+            return 2
         else:
             # Delivery failed — forget these dates so the next run retries
             # instead of silently swallowing the one alert that mattered.
@@ -280,7 +318,70 @@ def run(alerts=True, quiet=False):
     return 0
 
 
-def probe():
+def parse_targets():
+    """TARGET_TIMES -> list of (hour, minute), bad entries skipped."""
+    out = []
+    for chunk in TARGET_TIMES.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            h, m = chunk.split(":")
+            h, m = int(h), int(m)
+        except ValueError:
+            print(f"  ! ignoring bad TARGET_TIMES entry: {chunk!r}")
+            continue
+        if 0 <= h < 24 and 0 <= m < 60:
+            out.append((h, m))
+    return out
+
+
+def next_window(now):
+    """
+    The opening time this run should camp on, or None.
+
+    Returns a target datetime if now is inside [target - LEAD, target + TRAIL].
+    Checks yesterday/today/tomorrow so late-night targets work across midnight.
+    """
+    lead = datetime.timedelta(minutes=LEAD_MINUTES)
+    trail = datetime.timedelta(minutes=TRAIL_MINUTES)
+    for day_offset in (-1, 0, 1):
+        day = now.date() + datetime.timedelta(days=day_offset)
+        for hour, minute in parse_targets():
+            target = datetime.datetime.combine(
+                day, datetime.time(hour, minute), tzinfo=KST
+            )
+            if target - lead <= now <= target + trail:
+                return target
+    return None
+
+
+def burst(target):
+    """Poll tightly across an opening moment until something opens or time's up."""
+    now = datetime.datetime.now(KST)
+    end = target + datetime.timedelta(minutes=TRAIL_MINUTES)
+
+    # Wake up a few seconds before the hour rather than exactly on it.
+    start_at = target - datetime.timedelta(seconds=30)
+    if now < start_at:
+        wait = (start_at - now).total_seconds()
+        print(f"target {target:%H:%M} KST — sleeping {int(wait)}s until {start_at:%H:%M:%S}")
+        time.sleep(wait)
+    else:
+        print(f"target {target:%H:%M} KST — already inside the window, polling now")
+
+    polls = 0
+    while datetime.datetime.now(KST) <= end:
+        polls += 1
+        print(f"--- poll {polls} at {datetime.datetime.now(KST):%H:%M:%S} ---")
+        rc = run()
+        if rc == 2:
+            print(f"opened on poll {polls}")
+            return 0
+        time.sleep(POLL_SECONDS + random.uniform(-2, 2))
+
+    print(f"window closed after {polls} polls — nothing new")
+    return 0
     print(f"movNo={MOV_NO} ({MOV_LABEL})\n")
     ok = True
     for site_no, name in THEATERS.items():
@@ -312,7 +413,16 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--baseline", action="store_true")
+    ap.add_argument("--no-burst", action="store_true",
+                    help="force a single check even inside an opening window")
     args = ap.parse_args()
     if args.probe:
         sys.exit(probe())
-    sys.exit(run(alerts=not args.baseline))
+    if args.baseline:
+        sys.exit(run(alerts=False))
+
+    window = next_window(datetime.datetime.now(KST))
+    if window and not args.no_burst:
+        sys.exit(burst(window))
+    rc = run()
+    sys.exit(0 if rc == 2 else rc)
